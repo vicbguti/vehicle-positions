@@ -1,0 +1,100 @@
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+func main() {
+	port := envOrDefault("PORT", "8080")
+	databaseURL := envOrDefault("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/vehicle_positions?sslmode=disable")
+	maxAge := envDurationOrDefault("STALENESS_THRESHOLD", 5*time.Minute)
+
+	readTimeout := envDurationOrDefault("READ_TIMEOUT", 15*time.Second)
+	writeTimeout := envDurationOrDefault("WRITE_TIMEOUT", 15*time.Second)
+	idleTimeout := envDurationOrDefault("IDLE_TIMEOUT", 60*time.Second)
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	store, err := NewStore(ctx, databaseURL)
+	if err != nil {
+		log.Fatalf("failed to initialize store: %v", err)
+	}
+
+	if err := store.Migrate(databaseURL); err != nil {
+		log.Fatalf("could not run migrations: %v", err)
+	}
+
+	defer store.Close()
+
+	tracker := NewTracker(maxAge)
+
+	cutoff := time.Now().Add(-maxAge)
+	recentLocations, err := store.GetRecentLocations(ctx, cutoff)
+	if err != nil {
+		log.Printf("warning: failed to seed tracker from database: %v", err)
+	} else {
+		for _, loc := range recentLocations {
+			tracker.Update(loc)
+		}
+		log.Printf("seeded tracker with %d active vehicles", len(recentLocations))
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/auth/login", handleLogin(store))
+	mux.HandleFunc("POST /api/v1/admin/drivers", handleAdminCreateDriver(store))
+	mux.HandleFunc("POST /api/v1/locations", AuthMiddleware(handlePostLocation(store, tracker)))
+	mux.HandleFunc("GET /gtfs-rt/vehicle-positions", handleGetFeed(tracker))
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	srv := &http.Server{
+		Addr:         ":" + port,
+		Handler:      mux,
+		ReadTimeout:  readTimeout,
+		WriteTimeout: writeTimeout,
+		IdleTimeout:  idleTimeout,
+	}
+
+	go func() {
+		log.Printf("starting vehicle-positions server on http://localhost:%s", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("shutting down...")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown error: %v", err)
+	}
+}
+
+func envOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func envDurationOrDefault(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			log.Printf("invalid duration for %s: %q, using default %v", key, v, fallback)
+			return fallback
+		}
+		return d
+	}
+	return fallback
+}
